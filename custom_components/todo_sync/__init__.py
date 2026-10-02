@@ -5,6 +5,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 
 from .const import DOMAIN
+from .storage import MappingStore
 from .sync import SyncSetupError, TodoSyncEngine
 
 
@@ -25,3 +26,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if engine is not None:
         await engine.async_stop()
     return True
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete mapping storage when a config entry is removed."""
+    await MappingStore(hass, entry.entry_id).async_remove()

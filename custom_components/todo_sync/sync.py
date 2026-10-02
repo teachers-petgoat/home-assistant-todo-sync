@@ -33,6 +33,12 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+# The first confirmation plus four out-of-order callbacks are protected. Most
+# providers settle sooner through consecutive confirmation; this is a strict
+# memory/suppression bound rather than a time-based delay.
+SETTLING_MAX_GENERATIONS = 5
+SETTLING_CONSECUTIVE_OBSERVATIONS = 2
+
 
 class SyncSetupError(RuntimeError):
     """Raised when configured entity-registry references cannot be resolved."""
@@ -74,6 +80,16 @@ class ExpectedOperation:
         return item.normalized_summary if item else ""
 
 
+@dataclass(slots=True)
+class SettlingOperation:
+    """A confirmed operation awaiting evidence that callbacks have settled."""
+
+    expected: ExpectedOperation
+    confirmed_generation: int
+    confirmed_observations: int = 1
+    inverse_observations: int = 0
+
+
 class TodoSyncEngine:
     """Synchronize two TodoListEntity instances using complete snapshots."""
 
@@ -97,7 +113,7 @@ class TodoSyncEngine:
         }
         # Confirmed operations remain as non-pending stale guards. Cloud providers
         # can deliver an older snapshot even after delivering the confirmation.
-        self._confirmed: dict[Side, list[ExpectedOperation]] = {
+        self._confirmed: dict[Side, list[SettlingOperation]] = {
             Side.A: [],
             Side.B: [],
         }
@@ -250,14 +266,16 @@ class TodoSyncEngine:
             )
             previous = self.snapshots[side]
             pending_count = len(self._expected[side])
-            effective = self._classify_and_mask_expected(side, previous, current)
+            effective, authoritative = self._classify_and_mask_expected(
+                side, previous, current
+            )
             if len(self._expected[side]) != pending_count:
                 await self.store.async_save()
             if effective == previous:
-                self.snapshots[side] = current
+                self.snapshots[side] = authoritative
                 return
             await self._apply_delta(side, previous, effective)
-            self.snapshots[side] = current
+            self.snapshots[side] = authoritative
 
     def _expect(self, side: Side, operation: ExpectedOperation) -> None:
         """Record an internal operation without advancing provider authority."""
@@ -359,11 +377,73 @@ class TodoSyncEngine:
         if operation.pair_id and operation.pair_id in self.store.pairs:
             self.store.pairs[operation.pair_id].set_uid(side, uid)
 
-    def _classify_and_mask_expected(
+    def _classify_and_mask_expected(  # noqa: C901, PLR0912
         self, side: Side, previous: Snapshot, current: Snapshot
-    ) -> Snapshot:
+    ) -> tuple[Snapshot, Snapshot]:
         """Mask stale/internal differences while preserving unrelated changes."""
         effective = dict(current)
+        authoritative = dict(current)
+
+        # A provider is considered settled after two consecutive observations of
+        # the confirmed state. Conversely, two consecutive observations of the
+        # pre-operation state retire the guard and allow the second observation
+        # through as a genuine inverse user action.
+        settling: list[SettlingOperation] = []
+        for guard in self._confirmed[side]:
+            if (
+                self._generation[side] - guard.confirmed_generation
+                >= SETTLING_MAX_GENERATIONS
+            ):
+                _LOGGER.debug(
+                    "Expected %s retired at stabilization generation limit on side %s",
+                    guard.expected.operation,
+                    side,
+                )
+                continue
+            state, affected = self._classify_operation(guard.expected, current)
+            if state is OperationSnapshotState.CONFIRMED:
+                guard.confirmed_observations += 1
+                guard.inverse_observations = 0
+                self._mask_operation(guard.expected, affected, previous, effective)
+                if guard.confirmed_observations < SETTLING_CONSECUTIVE_OBSERVATIONS:
+                    settling.append(guard)
+                else:
+                    _LOGGER.debug(
+                        "Expected %s retired after provider settled on side %s",
+                        guard.expected.operation,
+                        side,
+                    )
+                continue
+            if state is OperationSnapshotState.STALE:
+                guard.confirmed_observations = 0
+                guard.inverse_observations += 1
+                if guard.inverse_observations < SETTLING_CONSECUTIVE_OBSERVATIONS:
+                    self._mask_operation(guard.expected, affected, previous, effective)
+                    self._mask_operation(
+                        guard.expected, affected, previous, authoritative
+                    )
+                    settling.append(guard)
+                    _LOGGER.debug(
+                        "Post-confirmation stale snapshot masked for %s on side %s",
+                        guard.expected.operation,
+                        side,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Expected %s retired after repeated inverse state on side %s",
+                        guard.expected.operation,
+                        side,
+                    )
+                continue
+            # An unrelated third state is not the known stale callback. Stop
+            # allowing historical operation state to influence future deltas.
+            _LOGGER.debug(
+                "Expected %s retired on new provider state for side %s",
+                guard.expected.operation,
+                side,
+            )
+        self._confirmed[side] = settling
+
         remaining: list[ExpectedOperation] = []
         for operation in self._expected[side]:
             state, affected = self._classify_operation(operation, current)
@@ -379,7 +459,9 @@ class TodoSyncEngine:
                     ExpectedOperationType.RENAME,
                 ):
                     confirmed = replace(operation, after=current[uid])
-                self._confirmed[side].append(confirmed)
+                self._confirmed[side].append(
+                    SettlingOperation(confirmed, self._generation[side])
+                )
                 _LOGGER.debug(
                     "Expected %s confirmed on side %s", operation.operation, side
                 )
@@ -398,23 +480,10 @@ class TodoSyncEngine:
                         side,
                     )
             self._mask_operation(operation, affected, previous, effective)
+            if state is not OperationSnapshotState.CONFIRMED:
+                self._mask_operation(operation, affected, previous, authoritative)
         self._expected[side] = remaining
-        # A confirmation does not make older cloud callbacks impossible. These
-        # guards are deliberately separate from pending operations.
-        for operation in self._confirmed[side]:
-            state, affected = self._classify_operation(operation, current)
-            if state in (
-                OperationSnapshotState.STALE,
-                OperationSnapshotState.CONFIRMED,
-            ):
-                self._mask_operation(operation, affected, previous, effective)
-                if state is OperationSnapshotState.STALE:
-                    _LOGGER.debug(
-                        "Post-confirmation stale snapshot masked for %s on side %s",
-                        operation.operation,
-                        side,
-                    )
-        return effective
+        return effective, authoritative
 
     def _pair_for_uid(self, side: Side, uid: str) -> ItemPair | None:
         return next(

@@ -560,12 +560,145 @@ async def test_alternating_stale_create_snapshots_remain_bounded(
     a._attr_todo_items.append(item("a", "Bread"))
     a.async_update_listeners()
     await hass.async_block_till_done()
-    for _ in range(4):
-        b.cloud_snapshot([])
-        await hass.async_block_till_done()
-        b.cloud_snapshot([item("b", "Bread")])
-        await hass.async_block_till_done()
+    b.cloud_snapshot([])
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("b", "Bread")])
+    await hass.async_block_till_done()
+    b.cloud_snapshot([])
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("b", "Bread")])
+    await hass.async_block_till_done()
 
     assert b.calls == ["create"]
     assert a.calls == []
     assert len(runtime.store.pairs) == 1
+
+
+async def test_settled_create_allows_later_user_delete(
+    hass: HomeAssistant,
+) -> None:
+    """A CREATE guard retires before a later genuine target-side DELETE."""
+    a = MemoryTodoEntity([], emit_updates=True)
+    b = DelayedTodoEntity([])
+    runtime = engine(a, b)
+    subscribe_engine(runtime, hass)
+
+    a._attr_todo_items.append(item("a"))
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("b")])
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("b")])
+    await hass.async_block_till_done()
+    assert not runtime._confirmed[Side.B]
+
+    b.cloud_snapshot([])
+    await hass.async_block_till_done()
+
+    assert not a.todo_items
+    assert a.calls == ["delete"]
+    assert b.calls == ["create"]
+
+
+async def test_settled_status_allows_later_user_reopen(
+    hass: HomeAssistant,
+) -> None:
+    """A retired status guard cannot swallow a later genuine inverse update."""
+    a = MemoryTodoEntity([item("a")], emit_updates=True)
+    b = DelayedTodoEntity([item("b")])
+    runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
+    subscribe_engine(runtime, hass)
+
+    a.todo_items[0].status = TodoItemStatus.COMPLETED
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    completed = [item("b", status=TodoItemStatus.COMPLETED)]
+    b.cloud_snapshot(completed)
+    await hass.async_block_till_done()
+    b.cloud_snapshot(completed)
+    await hass.async_block_till_done()
+
+    b.cloud_snapshot([item("b")])
+    await hass.async_block_till_done()
+
+    assert a.todo_items[0].status is TodoItemStatus.NEEDS_ACTION
+    assert a.calls == ["update"]
+    assert b.calls == ["update"]
+
+
+async def test_settled_rename_allows_later_rename_back(
+    hass: HomeAssistant,
+) -> None:
+    """A retired rename guard cannot hide a user restoring the old summary."""
+    a = MemoryTodoEntity([item("a")], emit_updates=True)
+    b = DelayedTodoEntity([item("b")])
+    runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
+    subscribe_engine(runtime, hass)
+
+    a.todo_items[0].summary = "Whole milk"
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    renamed = [item("b", "Whole milk")]
+    b.cloud_snapshot(renamed)
+    await hass.async_block_till_done()
+    b.cloud_snapshot(renamed)
+    await hass.async_block_till_done()
+
+    b.cloud_snapshot([item("b")])
+    await hass.async_block_till_done()
+
+    assert a.todo_items[0].summary == "Milk"
+    assert a.calls == ["update"]
+    assert b.calls == ["update"]
+
+
+async def test_settled_delete_allows_later_genuine_readd(
+    hass: HomeAssistant,
+) -> None:
+    """A new same-summary item after a settled DELETE is synchronized as an ADD."""
+    a = MemoryTodoEntity([item("a")], emit_updates=True)
+    b = DelayedTodoEntity([item("b")])
+    runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
+    subscribe_engine(runtime, hass)
+
+    a._attr_todo_items.clear()
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    b.cloud_snapshot([])
+    await hass.async_block_till_done()
+    b.cloud_snapshot([])
+    await hass.async_block_till_done()
+
+    b.cloud_snapshot([item("new-b")])
+    await hass.async_block_till_done()
+
+    assert len(a.todo_items or []) == 1
+    assert a.calls == ["create"]
+    assert b.calls == ["delete"]
+
+
+async def test_confirmed_guards_are_retired_after_many_settled_operations(
+    hass: HomeAssistant,
+) -> None:
+    """Settled internal operations never accumulate as historical masks."""
+    a = MemoryTodoEntity([item("a")], emit_updates=True)
+    b = DelayedTodoEntity([item("b")])
+    runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
+    subscribe_engine(runtime, hass)
+
+    for index in range(8):
+        status = (
+            TodoItemStatus.COMPLETED if index % 2 == 0 else TodoItemStatus.NEEDS_ACTION
+        )
+        a.todo_items[0].status = status
+        a.async_update_listeners()
+        await hass.async_block_till_done()
+        settled = [item("b", status=status)]
+        b.cloud_snapshot(settled)
+        await hass.async_block_till_done()
+        b.cloud_snapshot(settled)
+        await hass.async_block_till_done()
+
+    assert len(b.calls) == 8
+    assert not runtime._expected[Side.B]
+    assert not runtime._confirmed[Side.B]

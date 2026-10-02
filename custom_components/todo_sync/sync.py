@@ -47,6 +47,14 @@ class ExpectedOperationType(StrEnum):
     DELETE = "delete"
 
 
+class OperationSnapshotState(StrEnum):
+    """How a provider snapshot relates to an internal mutation."""
+
+    CONFIRMED = "confirmed"
+    STALE = "stale"
+    CONFLICT = "conflict"
+
+
 @dataclass(frozen=True, slots=True)
 class ExpectedOperation:
     """The exact before/after mutation expected from one provider."""
@@ -54,12 +62,16 @@ class ExpectedOperation:
     operation: ExpectedOperationType
     before: SyncItem | None
     after: SyncItem | None
+    before_uids: frozenset[str] = frozenset()
+    source_side: Side | None = None
+    source_uid: str | None = None
+    pair_id: str | None = None
 
-    def is_reflected_in(self, current: Snapshot) -> bool:
-        """Return whether a complete snapshot contains this exact result."""
-        if self.operation is ExpectedOperationType.DELETE:
-            return self.before is not None and self.before.uid not in current
-        return self.after is not None and current.get(self.after.uid) == self.after
+    @property
+    def normalized_summary(self) -> str:
+        """Return the logical item key involved in this operation."""
+        item = self.after or self.before
+        return item.normalized_summary if item else ""
 
 
 class TodoSyncEngine:
@@ -83,6 +95,13 @@ class TodoSyncEngine:
             Side.A: [],
             Side.B: [],
         }
+        # Confirmed operations remain as non-pending stale guards. Cloud providers
+        # can deliver an older snapshot even after delivering the confirmation.
+        self._confirmed: dict[Side, list[ExpectedOperation]] = {
+            Side.A: [],
+            Side.B: [],
+        }
+        self._generation: dict[Side, int] = {Side.A: 0, Side.B: 0}
 
     async def async_start(self) -> None:
         """Resolve entities, load state, subscribe, and establish a baseline."""
@@ -222,29 +241,180 @@ class TodoSyncEngine:
             if not self._both_available():
                 _LOGGER.debug("Deferring Todo Sync update while a list is unavailable")
                 return
-            self._consume_expected(side, current)
+            self._generation[side] += 1
+            _LOGGER.debug(
+                "Received Todo Sync snapshot generation %d for side %s (%d items)",
+                self._generation[side],
+                side,
+                len(current),
+            )
             previous = self.snapshots[side]
-            if current == previous:
+            pending_count = len(self._expected[side])
+            effective = self._classify_and_mask_expected(side, previous, current)
+            if len(self._expected[side]) != pending_count:
+                await self.store.async_save()
+            if effective == previous:
+                self.snapshots[side] = current
                 return
-            await self._apply_delta(side, previous, current)
+            await self._apply_delta(side, previous, effective)
             self.snapshots[side] = current
 
     def _expect(self, side: Side, operation: ExpectedOperation) -> None:
-        """Advance only the exact target item changed by an internal operation."""
+        """Record an internal operation without advancing provider authority."""
         self._expected[side].append(operation)
-        baseline = self.snapshots[side]
-        if operation.before is not None:
-            baseline.pop(operation.before.uid, None)
-        if operation.after is not None:
-            baseline[operation.after.uid] = operation.after
+        _LOGGER.debug(
+            "Pending expected %s created for side %s summary %r",
+            operation.operation,
+            side,
+            operation.normalized_summary,
+        )
 
-    def _consume_expected(self, side: Side, current: Snapshot) -> None:
-        """Consume reflected echoes without suppressing other snapshot changes."""
-        self._expected[side] = [
-            operation
-            for operation in self._expected[side]
-            if not operation.is_reflected_in(current)
-        ]
+    def _classify_operation(  # noqa: C901, PLR0911
+        self, operation: ExpectedOperation, current: Snapshot
+    ) -> tuple[OperationSnapshotState, set[str]]:
+        """Classify one snapshot and return provider UIDs affected by it."""
+        before, after = operation.before, operation.after
+        if operation.operation is ExpectedOperationType.CREATE:
+            candidates = {
+                item.uid
+                for item in current.values()
+                if item.uid not in operation.before_uids
+                and after is not None
+                and item.normalized_summary == after.normalized_summary
+                and item.status is after.status
+            }
+            if len(candidates) == 1:
+                return OperationSnapshotState.CONFIRMED, candidates
+            if not candidates:
+                return OperationSnapshotState.STALE, set()
+            return OperationSnapshotState.CONFLICT, candidates
+        if before is None:
+            return OperationSnapshotState.CONFLICT, set()
+        if operation.operation is ExpectedOperationType.DELETE:
+            value = current.get(before.uid)
+            if value == before:
+                return OperationSnapshotState.STALE, {before.uid}
+            if value is None:
+                return OperationSnapshotState.CONFIRMED, {before.uid}
+            return OperationSnapshotState.CONFLICT, {before.uid}
+        if current.get(before.uid) == before:
+            return OperationSnapshotState.STALE, {before.uid}
+        if after is None:
+            return OperationSnapshotState.CONFLICT, {before.uid}
+        if current.get(after.uid) == after:
+            return OperationSnapshotState.CONFIRMED, {before.uid, after.uid}
+        candidates = {
+            item.uid
+            for item in current.values()
+            if item.normalized_summary == after.normalized_summary
+            and item.status is after.status
+            and item.uid != before.uid
+        }
+        if operation.operation is ExpectedOperationType.RENAME and len(candidates) == 1:
+            return OperationSnapshotState.CONFIRMED, {before.uid, *candidates}
+        return OperationSnapshotState.CONFLICT, {before.uid, *candidates}
+
+    def _mask_operation(
+        self,
+        operation: ExpectedOperation,
+        affected: set[str],
+        previous: Snapshot,
+        effective: Snapshot,
+    ) -> None:
+        """Restore only an operation's affected region from the prior baseline."""
+        affected.update(
+            uid
+            for uid, item in effective.items()
+            if uid not in operation.before_uids
+            and item.normalized_summary == operation.normalized_summary
+        )
+        if operation.after is not None and operation.after.uid:
+            affected.add(operation.after.uid)
+        for uid in affected:
+            if uid in previous:
+                effective[uid] = previous[uid]
+            else:
+                effective.pop(uid, None)
+        if operation.before is not None and operation.before.uid in previous:
+            effective[operation.before.uid] = previous[operation.before.uid]
+
+    def _adopt_confirmed(
+        self, side: Side, operation: ExpectedOperation, uid: str
+    ) -> None:
+        """Adopt a provider-assigned UID after create or replacement rename."""
+        if operation.operation is ExpectedOperationType.CREATE:
+            if operation.source_side is None or operation.source_uid is None:
+                return
+            pair = ItemPair(
+                operation.pair_id or str(uuid4()),
+                "",
+                "",
+                operation.normalized_summary,
+            )
+            pair.set_uid(operation.source_side, operation.source_uid)
+            pair.set_uid(side, uid)
+            self.store.pairs[pair.pair_id] = pair
+            _LOGGER.debug("Unresolved create adopted as %s:%s", side, uid)
+            return
+        if operation.pair_id and operation.pair_id in self.store.pairs:
+            self.store.pairs[operation.pair_id].set_uid(side, uid)
+
+    def _classify_and_mask_expected(
+        self, side: Side, previous: Snapshot, current: Snapshot
+    ) -> Snapshot:
+        """Mask stale/internal differences while preserving unrelated changes."""
+        effective = dict(current)
+        remaining: list[ExpectedOperation] = []
+        for operation in self._expected[side]:
+            state, affected = self._classify_operation(operation, current)
+            if state is OperationSnapshotState.CONFIRMED:
+                uid = next(
+                    (value for value in affected if value in current),
+                    operation.after.uid if operation.after else "",
+                )
+                self._adopt_confirmed(side, operation, uid)
+                confirmed = operation
+                if uid in current and operation.operation in (
+                    ExpectedOperationType.CREATE,
+                    ExpectedOperationType.RENAME,
+                ):
+                    confirmed = replace(operation, after=current[uid])
+                self._confirmed[side].append(confirmed)
+                _LOGGER.debug(
+                    "Expected %s confirmed on side %s", operation.operation, side
+                )
+            else:
+                remaining.append(operation)
+                if state is OperationSnapshotState.STALE:
+                    _LOGGER.debug(
+                        "Stale snapshot masked for expected %s on side %s",
+                        operation.operation,
+                        side,
+                    )
+                else:
+                    _LOGGER.warning(
+                        "Expected %s conflict on side %s requires reconciliation",
+                        operation.operation,
+                        side,
+                    )
+            self._mask_operation(operation, affected, previous, effective)
+        self._expected[side] = remaining
+        # A confirmation does not make older cloud callbacks impossible. These
+        # guards are deliberately separate from pending operations.
+        for operation in self._confirmed[side]:
+            state, affected = self._classify_operation(operation, current)
+            if state in (
+                OperationSnapshotState.STALE,
+                OperationSnapshotState.CONFIRMED,
+            ):
+                self._mask_operation(operation, affected, previous, effective)
+                if state is OperationSnapshotState.STALE:
+                    _LOGGER.debug(
+                        "Post-confirmation stale snapshot masked for %s on side %s",
+                        operation.operation,
+                        side,
+                    )
+        return effective
 
     def _pair_for_uid(self, side: Side, uid: str) -> ItemPair | None:
         return next(
@@ -288,7 +458,13 @@ class TodoSyncEngine:
                 await self.entities[side.opposite].async_delete_todo_items([target_uid])
                 self._expect(
                     side.opposite,
-                    ExpectedOperation(ExpectedOperationType.DELETE, deleted, None),
+                    ExpectedOperation(
+                        ExpectedOperationType.DELETE,
+                        deleted,
+                        None,
+                        frozenset(self.snapshots[side.opposite]),
+                        pair_id=pair.pair_id,
+                    ),
                 )
                 _LOGGER.debug("Propagated DELETE %s:%s", side, uid)
             self.store.pairs.pop(pair.pair_id, None)
@@ -308,11 +484,34 @@ class TodoSyncEngine:
 
     async def _propagate_add(self, source: Side, item: SyncItem) -> None:
         target = source.opposite
+        if any(
+            operation.operation is ExpectedOperationType.CREATE
+            and operation.source_side is source
+            and operation.source_uid == item.uid
+            for operation in self._expected[target]
+        ):
+            _LOGGER.debug(
+                "CREATE remains unresolved for %s:%s; not retrying", source, item.uid
+            )
+            return
         matches = [
             candidate
             for candidate in self._current(target).values()
             if candidate.normalized_summary == item.normalized_summary
         ]
+        same_status = [
+            candidate for candidate in matches if candidate.status is item.status
+        ]
+        if same_status:
+            matches = same_status
+        elif item.status is TodoItemStatus.NEEDS_ACTION:
+            active = [
+                candidate
+                for candidate in matches
+                if candidate.status is TodoItemStatus.NEEDS_ACTION
+            ]
+            if active:
+                matches = active
         if len(matches) > 1:
             _LOGGER.warning(
                 "Ambiguous duplicate items for normalized summary %r",
@@ -325,10 +524,21 @@ class TodoSyncEngine:
                 item.normalized_summary,
             )
             return
-        target_item = matches[0] if matches else await self._create(target, item)
+        pair_id = str(uuid4())
+        target_item = (
+            matches[0]
+            if matches
+            else await self._create(
+                target,
+                item,
+                source_side=source,
+                source_uid=item.uid,
+                pair_id=pair_id,
+            )
+        )
         if target_item is None:
             return
-        pair = ItemPair(str(uuid4()), "", "", item.normalized_summary)
+        pair = ItemPair(pair_id, "", "", item.normalized_summary)
         pair.set_uid(source, item.uid)
         pair.set_uid(target, target_item.uid)
         self.store.pairs[pair.pair_id] = pair
@@ -348,7 +558,13 @@ class TodoSyncEngine:
             _LOGGER.warning(
                 "Mapped target missing during update; repairing conservatively"
             )
-            replacement = await self._create(target, new)
+            replacement = await self._create(
+                target,
+                new,
+                source_side=source,
+                source_uid=new.uid,
+                pair_id=pair.pair_id,
+            )
             if replacement:
                 pair.set_uid(target, replacement.uid)
             return
@@ -374,29 +590,46 @@ class TodoSyncEngine:
             pair.set_uid(target, replacement.uid)
             pair.normalized_summary = new.normalized_summary
 
-    async def _create(self, side: Side, item: SyncItem) -> SyncItem | None:
+    async def _create(
+        self,
+        side: Side,
+        item: SyncItem,
+        *,
+        source_side: Side | None = None,
+        source_uid: str | None = None,
+        pair_id: str | None = None,
+    ) -> SyncItem | None:
         entity = self.entities[side]
         before = self._current(side)
         await entity.async_create_todo_item(
             TodoItem(summary=item.summary, status=item.status)
         )
-        await entity.async_update_ha_state(force_refresh=True)
         after = self._current(side)
         created = [
             value
             for uid, value in after.items()
             if uid not in before and value.normalized_summary == item.normalized_summary
         ]
-        if len(created) != 1:
+        result = created[0] if len(created) == 1 else None
+        expected_after = result or SyncItem("", item.summary, item.status)
+        self._expect(
+            side,
+            ExpectedOperation(
+                ExpectedOperationType.CREATE,
+                None,
+                expected_after,
+                frozenset(before),
+                source_side,
+                source_uid,
+                pair_id,
+            ),
+        )
+        if result is None:
             _LOGGER.warning(
                 "Could not identify newly created Todo Sync item unambiguously"
             )
             return None
-        self._expect(
-            side,
-            ExpectedOperation(ExpectedOperationType.CREATE, None, created[0]),
-        )
-        return created[0]
+        return result
 
     async def _update(
         self,
@@ -420,7 +653,6 @@ class TodoSyncEngine:
             status=status if status is not None else existing.status,
         )
         await entity.async_update_todo_item(updated)
-        await entity.async_update_ha_state(force_refresh=True)
         after = self._current(side)
         normalized = (
             summary.strip().casefold()
@@ -433,19 +665,26 @@ class TodoSyncEngine:
             item for item in after.values() if item.normalized_summary == normalized
         ]
         result = after.get(uid) or (candidates[0] if len(candidates) == 1 else None)
-        if result is not None:
-            before = SyncItem.from_todo_item(existing)
-            if before is not None:
-                self._expect(
-                    side,
-                    ExpectedOperation(
-                        ExpectedOperationType.RENAME
-                        if summary is not None
-                        else ExpectedOperationType.UPDATE_STATUS,
-                        before,
-                        result,
-                    ),
-                )
+        before = SyncItem.from_todo_item(existing)
+        if before is not None:
+            expected_after = SyncItem(
+                uid,
+                summary if summary is not None else before.summary,
+                status if status is not None else before.status,
+            )
+            pair = self._pair_for_uid(side, uid)
+            self._expect(
+                side,
+                ExpectedOperation(
+                    ExpectedOperationType.RENAME
+                    if summary is not None
+                    else ExpectedOperationType.UPDATE_STATUS,
+                    before,
+                    expected_after,
+                    frozenset(self.snapshots[side]),
+                    pair_id=pair.pair_id if pair else None,
+                ),
+            )
         return result
 
     async def async_reconcile(self) -> None:  # noqa: C901, PLR0912, PLR0915

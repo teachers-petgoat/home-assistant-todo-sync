@@ -123,6 +123,8 @@ def engine(
     }
     result.store = MemoryStore(pairs)
     result._expected = {Side.A: [], Side.B: []}
+    result._confirmed = {Side.A: [], Side.B: []}
+    result._generation = {Side.A: 0, Side.B: 0}
     return result
 
 
@@ -138,6 +140,27 @@ def subscribe_engine(runtime: TodoSyncEngine, hass: HomeAssistant) -> None:
     runtime._available = {Side.A: True, Side.B: True}
     runtime._update_availability = lambda: None
     runtime._subscribe()
+
+
+class DelayedTodoEntity(MemoryTodoEntity):
+    """Strict provider double whose mutations complete only on cloud delivery."""
+
+    async def async_create_todo_item(self, item: TodoItem) -> None:
+        del item
+        self.calls.append("create")
+
+    async def async_update_todo_item(self, item: TodoItem) -> None:
+        del item
+        self.calls.append("update")
+
+    async def async_delete_todo_items(self, uids: list[str]) -> None:
+        del uids
+        self.calls.append("delete")
+
+    def cloud_snapshot(self, items: list[TodoItem]) -> None:
+        """Deliver a complete provider snapshot through the real subscription."""
+        self._attr_todo_items = items
+        self.async_update_listeners()
 
 
 @pytest.mark.parametrize("source", [Side.A, Side.B])
@@ -377,3 +400,172 @@ async def test_reconciliation_repairs_stale_mapping_uid() -> None:
     assert runtime.store.pairs["stable"].a_uid == "new-a"
     assert a.calls == []
     assert b.calls == []
+
+
+async def test_delayed_create_masks_old_snapshots_and_adopts_uid(
+    hass: HomeAssistant,
+) -> None:
+    """Repeated pre-create callbacks cannot invert a successful CREATE."""
+    a = MemoryTodoEntity([], emit_updates=True)
+    b = DelayedTodoEntity([])
+    runtime = engine(a, b)
+    subscribe_engine(runtime, hass)
+
+    a._attr_todo_items.append(item("a", "Bread"))
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    b.cloud_snapshot([])
+    b.cloud_snapshot([])
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("cloud-b", "Bread")])
+    await hass.async_block_till_done()
+
+    assert b.calls == ["create"]
+    assert a.calls == []
+    assert next(iter(runtime.store.pairs.values())).b_uid == "cloud-b"
+    assert len(b.todo_items or []) == 1
+
+
+async def test_delayed_delete_is_not_recreated(hass: HomeAssistant) -> None:
+    """The unchanged pre-delete callback is stale, not a new addition."""
+    a = MemoryTodoEntity([item("a")], emit_updates=True)
+    b = DelayedTodoEntity([item("b")])
+    runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
+    subscribe_engine(runtime, hass)
+
+    a._attr_todo_items.clear()
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("b")])
+    await hass.async_block_till_done()
+    b.cloud_snapshot([])
+    await hass.async_block_till_done()
+
+    assert b.calls == ["delete"]
+    assert a.calls == []
+    assert not a.todo_items
+
+
+async def test_delayed_status_does_not_propagate_inverse(
+    hass: HomeAssistant,
+) -> None:
+    """An old-status callback before confirmation is operation-local stale data."""
+    a = MemoryTodoEntity([item("a")], emit_updates=True)
+    b = DelayedTodoEntity([item("b")])
+    runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
+    subscribe_engine(runtime, hass)
+
+    a.todo_items[0].status = TodoItemStatus.COMPLETED
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("b")])
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("b", status=TodoItemStatus.COMPLETED)])
+    await hass.async_block_till_done()
+
+    assert b.calls == ["update"]
+    assert a.calls == []
+    assert a.todo_items[0].status is TodoItemStatus.COMPLETED
+
+
+async def test_delayed_rename_adopts_replacement_uid(
+    hass: HomeAssistant,
+) -> None:
+    """A stale old representation cannot start a delete/create rename loop."""
+    a = MemoryTodoEntity([item("a")], emit_updates=True)
+    b = DelayedTodoEntity([item("b")])
+    runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
+    subscribe_engine(runtime, hass)
+
+    a.todo_items[0].summary = "Whole milk"
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("b")])
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("replacement", "Whole milk")])
+    await hass.async_block_till_done()
+
+    assert b.calls == ["update"]
+    assert a.calls == []
+    assert runtime.store.pairs["pair"].b_uid == "replacement"
+
+
+async def test_unresolved_create_is_never_retried(hass: HomeAssistant) -> None:
+    """A sent CREATE remains protected until a later snapshot supplies its UID."""
+    a = MemoryTodoEntity([], emit_updates=True)
+    b = DelayedTodoEntity([])
+    runtime = engine(a, b)
+    subscribe_engine(runtime, hass)
+
+    a._attr_todo_items.append(item("a"))
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    await runtime.async_reconcile()
+    b.cloud_snapshot([item("later")])
+    await hass.async_block_till_done()
+
+    assert b.calls == ["create"]
+    assert next(iter(runtime.store.pairs.values())).b_uid == "later"
+
+
+async def test_ambiguous_delayed_create_stays_unresolved(
+    hass: HomeAssistant,
+) -> None:
+    """Multiple possible created UIDs cause neither retry nor destructive action."""
+    a = MemoryTodoEntity([], emit_updates=True)
+    b = DelayedTodoEntity([])
+    runtime = engine(a, b)
+    subscribe_engine(runtime, hass)
+
+    a._attr_todo_items.append(item("a"))
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("b1"), item("b2")])
+    await hass.async_block_till_done()
+    await runtime.async_reconcile()
+
+    assert b.calls == ["create"]
+    assert a.calls == []
+    assert runtime.store.pairs == {}
+
+
+async def test_stale_create_snapshot_keeps_unrelated_addition(
+    hass: HomeAssistant,
+) -> None:
+    """Masking is UID-local and still propagates another user's addition."""
+    a = MemoryTodoEntity([], emit_updates=True)
+    b = DelayedTodoEntity([])
+    runtime = engine(a, b)
+    subscribe_engine(runtime, hass)
+
+    a._attr_todo_items.append(item("a", "Milk"))
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("bread-b", "Bread")])
+    await hass.async_block_till_done()
+
+    assert {value.summary for value in a.todo_items or []} == {"Milk", "Bread"}
+    assert b.calls == ["create"]
+
+
+async def test_alternating_stale_create_snapshots_remain_bounded(
+    hass: HomeAssistant,
+) -> None:
+    """Even post-confirmation stale callbacks cannot cause cloud ping-pong."""
+    a = MemoryTodoEntity([], emit_updates=True)
+    b = DelayedTodoEntity([])
+    runtime = engine(a, b)
+    subscribe_engine(runtime, hass)
+
+    a._attr_todo_items.append(item("a", "Bread"))
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    for _ in range(4):
+        b.cloud_snapshot([])
+        await hass.async_block_till_done()
+        b.cloud_snapshot([item("b", "Bread")])
+        await hass.async_block_till_done()
+
+    assert b.calls == ["create"]
+    assert a.calls == []
+    assert len(runtime.store.pairs) == 1

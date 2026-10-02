@@ -64,3 +64,8 @@ class MappingStore:
                 },
             }
         )
+
+    async def async_remove(self) -> None:
+        """Remove this config entry's mapping data without touching todo items."""
+        await self._store.async_remove()
+        self.pairs.clear()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
@@ -20,7 +21,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_state_change_event
 
 from .const import CONF_ENTITY_A_REGISTRY_ID, CONF_ENTITY_B_REGISTRY_ID
-from .models import ItemPair, Side, Snapshot, SyncItem, snapshot, snapshot_json
+from .models import ItemPair, Side, Snapshot, SyncItem, snapshot
 from .storage import MappingStore
 
 if TYPE_CHECKING:
@@ -120,11 +121,13 @@ class TodoSyncEngine:
         for side, entity in self.entities.items():
 
             @callback
-            def receive(items: list[Any] | None, watched_side: Side = side) -> None:
+            def receive(
+                items: list[TodoItem] | None, watched_side: Side = side
+            ) -> None:
                 if self._stopped or items is None:
                     return
                 self.hass.async_create_task(
-                    self._async_receive(watched_side, snapshot_json(items))
+                    self._async_receive(watched_side, snapshot(items))
                 )
 
             self._unsub_updates.append(entity.async_subscribe_updates(receive))
@@ -151,14 +154,10 @@ class TodoSyncEngine:
         """Rebind subscriptions when either registry entry changes entity ID."""
         if event.data.get("action") != "update":
             return
-        tracked = {
-            self.entry.data.get(CONF_ENTITY_A_REGISTRY_ID),
-            self.entry.data.get(CONF_ENTITY_B_REGISTRY_ID),
-        }
-        if (
-            event.data.get("entity_id") not in self.entity_ids.values()
-            and event.data.get("entity_entry_id") not in tracked
-        ):
+        if not {
+            event.data.get("entity_id"),
+            event.data.get("old_entity_id"),
+        }.intersection(self.entity_ids.values()):
             return
         self.hass.async_create_task(self._async_rebind())
 
@@ -354,9 +353,18 @@ class TodoSyncEngine:
     ) -> SyncItem | None:
         """Update only shared fields, thereby preserving provider-only metadata."""
         entity = self.entities[side]
-        await entity.async_update_todo_item(
-            TodoItem(uid=uid, summary=summary, status=status)
+        existing = next(
+            (item for item in entity.todo_items or () if item.uid == uid), None
         )
+        if existing is None:
+            _LOGGER.warning("Cannot update missing Todo Sync target %s:%s", side, uid)
+            return None
+        updated = replace(
+            existing,
+            summary=summary if summary is not None else existing.summary,
+            status=status if status is not None else existing.status,
+        )
+        await entity.async_update_todo_item(updated)
         await entity.async_update_ha_state(force_refresh=True)
         after = self._current(side)
         if uid in after:

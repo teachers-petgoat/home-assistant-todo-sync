@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from homeassistant.components.todo import TodoItem, TodoItemStatus
 
@@ -37,24 +37,6 @@ class SyncItem:
             return None
         return cls(item.uid, item.summary, item.status)
 
-    @classmethod
-    def from_json(cls, value: Any) -> SyncItem | None:
-        """Convert the serialized item supplied by async_subscribe_updates."""
-        if not isinstance(value, dict):
-            return None
-        uid, summary, status = (
-            value.get("uid"),
-            value.get("summary"),
-            value.get("status"),
-        )
-        if not isinstance(uid, str) or not isinstance(summary, str):
-            return None
-        try:
-            parsed_status = TodoItemStatus(status)
-        except (TypeError, ValueError):
-            return None
-        return cls(uid, summary, parsed_status)
-
 
 Snapshot = dict[str, SyncItem]
 
@@ -62,12 +44,6 @@ Snapshot = dict[str, SyncItem]
 def snapshot(items: Iterable[TodoItem]) -> Snapshot:
     """Create an immutable-value snapshot indexed by provider UID."""
     converted = (SyncItem.from_todo_item(item) for item in items)
-    return {item.uid: item for item in converted if item is not None}
-
-
-def snapshot_json(items: Iterable[Any]) -> Snapshot:
-    """Create a snapshot from an update subscription payload."""
-    converted = (SyncItem.from_json(item) for item in items)
     return {item.uid: item for item in converted if item is not None}
 
 

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
+from datetime import UTC, datetime
 
 import pytest
 from homeassistant.components.todo import TodoItem, TodoItemStatus, TodoListEntity
+from homeassistant.core import HomeAssistant
 
 from custom_components.todo_sync.models import ItemPair, Side, snapshot
 from custom_components.todo_sync.sync import TodoSyncEngine
@@ -14,9 +17,16 @@ from custom_components.todo_sync.sync import TodoSyncEngine
 class MemoryTodoEntity(TodoListEntity):
     """Minimal provider that optionally replaces UIDs when renaming."""
 
-    def __init__(self, items: list[TodoItem], *, replace_rename: bool = False) -> None:
+    def __init__(
+        self,
+        items: list[TodoItem],
+        *,
+        replace_rename: bool = False,
+        emit_updates: bool = False,
+    ) -> None:
         self._attr_todo_items = items
         self.replace_rename = replace_rename
+        self.emit_updates = emit_updates
         self.calls: list[str] = []
         self._next_uid = 100
 
@@ -30,28 +40,31 @@ class MemoryTodoEntity(TodoListEntity):
                 status=item.status or TodoItemStatus.NEEDS_ACTION,
             )
         )
+        if self.emit_updates:
+            self.async_update_listeners()
 
     async def async_update_todo_item(self, item: TodoItem) -> None:
         self.calls.append("update")
+        assert item.summary is not None
         old = next(value for value in self._attr_todo_items if value.uid == item.uid)
         uid = (
-            str(self._next_uid + 1) if self.replace_rename and item.summary else old.uid
+            str(self._next_uid + 1)
+            if self.replace_rename and item.summary != old.summary
+            else old.uid
         )
         if uid != old.uid:
             self._next_uid += 1
-        self._attr_todo_items[self._attr_todo_items.index(old)] = TodoItem(
-            uid=uid,
-            summary=item.summary or old.summary,
-            status=item.status or old.status,
-            description=old.description,
-            due=old.due,
-        )
+        self._attr_todo_items[self._attr_todo_items.index(old)] = replace(item, uid=uid)
+        if self.emit_updates:
+            self.async_update_listeners()
 
     async def async_delete_todo_items(self, uids: list[str]) -> None:
         self.calls.append("delete")
         self._attr_todo_items = [
             item for item in self._attr_todo_items if item.uid not in uids
         ]
+        if self.emit_updates:
+            self.async_update_listeners()
 
     async def async_update_ha_state(self, force_refresh: bool = False) -> None:
         del force_refresh
@@ -76,7 +89,13 @@ def item(
     description: str | None = None,
 ) -> TodoItem:
     """Build a provider item."""
-    return TodoItem(uid=uid, summary=summary, status=status, description=description)
+    return TodoItem(
+        uid=uid,
+        summary=summary,
+        status=status,
+        description=description,
+        completed=datetime(2026, 1, 1, tzinfo=UTC),
+    )
 
 
 def engine(
@@ -122,6 +141,38 @@ async def test_duplicate_prevention() -> None:
     assert len(runtime.store.pairs) == 1
 
 
+async def test_real_subscription_payload_never_becomes_empty(
+    hass: HomeAssistant,
+) -> None:
+    """The actual TodoItem callback retains items and cannot imply deletion."""
+    a = MemoryTodoEntity([item("a")], emit_updates=True)
+    b = MemoryTodoEntity([item("b")], emit_updates=True)
+    runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
+    runtime.hass = hass
+    runtime.entity_ids = {Side.A: "todo.a", Side.B: "todo.b"}
+    runtime._unsub_updates = []
+    runtime._unsub_state = None
+    runtime._unsub_registry = None
+    runtime._stopped = False
+    runtime._lock = asyncio.Lock()
+    runtime._available = {Side.A: True, Side.B: True}
+    runtime._update_availability = lambda: None
+    runtime._subscribe()
+
+    a.todo_items[0].status = TodoItemStatus.COMPLETED
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+
+    assert set(runtime.snapshots[Side.A]) == {"a"}
+    assert b.calls == ["update"]
+    assert a.calls == []
+    assert "delete" not in b.calls
+    for unsubscribe in runtime._unsub_updates:
+        unsubscribe()
+    runtime._unsub_state()
+    runtime._unsub_registry()
+
+
 @pytest.mark.parametrize("source", [Side.A, Side.B])
 @pytest.mark.parametrize(
     ("before", "after"),
@@ -148,6 +199,8 @@ async def test_complete_and_reopen_both_directions(
 
     target = next(iter(entities[source.opposite].todo_items or []))
     assert target.status is after
+    assert target.summary == "Milk"
+    assert target.completed == datetime(2026, 1, 1, tzinfo=UTC)
     if source is Side.A:
         assert target.description == "two litres"
 
@@ -156,8 +209,10 @@ async def test_complete_and_reopen_both_directions(
 async def test_rename_both_directions_and_replacement_uid(source: Side) -> None:
     """Rename follows mappings and records a target provider's replacement UID."""
     entities = {
-        Side.A: MemoryTodoEntity([item("a")]),
-        Side.B: MemoryTodoEntity([item("b")], replace_rename=True),
+        Side.A: MemoryTodoEntity([item("a", description="A metadata")]),
+        Side.B: MemoryTodoEntity(
+            [item("b", description="B metadata")], replace_rename=True
+        ),
     }
     runtime = engine(
         entities[Side.A], entities[Side.B], [ItemPair("pair", "a", "b", "milk")]
@@ -170,6 +225,10 @@ async def test_rename_both_directions_and_replacement_uid(source: Side) -> None:
     assert (
         next(iter(entities[source.opposite].todo_items or [])).summary == "Whole milk"
     )
+    target = next(iter(entities[source.opposite].todo_items or []))
+    assert target.status is TodoItemStatus.NEEDS_ACTION
+    assert target.completed == datetime(2026, 1, 1, tzinfo=UTC)
+    assert target.description == f"{source.opposite.value.upper()} metadata"
     if source is Side.A:
         assert runtime.store.pairs["pair"].b_uid != "b"
 
@@ -237,3 +296,19 @@ async def test_reconciliation_leaves_ambiguous_duplicates_alone() -> None:
     assert len(a.todo_items or []) == 2
     assert len(b.todo_items or []) == 1
     assert runtime.store.pairs == {}
+
+
+async def test_reconciliation_repairs_stale_mapping_uid() -> None:
+    """An exact unique item repairs a provider UID changed during downtime."""
+    a = MemoryTodoEntity([item("new-a")])
+    b = MemoryTodoEntity([item("b")])
+    runtime = engine(a, b, [ItemPair("stable", "stale-a", "b", "milk")])
+    runtime._lock = asyncio.Lock()
+    runtime._available = {Side.A: True, Side.B: True}
+    runtime._update_availability = lambda: None
+
+    await runtime.async_reconcile()
+
+    assert runtime.store.pairs["stable"].a_uid == "new-a"
+    assert a.calls == []
+    assert b.calls == []

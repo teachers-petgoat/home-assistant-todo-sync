@@ -23,10 +23,12 @@ class MemoryTodoEntity(TodoListEntity):
         *,
         replace_rename: bool = False,
         emit_updates: bool = False,
+        concurrent_change: TodoItem | None = None,
     ) -> None:
         self._attr_todo_items = items
         self.replace_rename = replace_rename
         self.emit_updates = emit_updates
+        self.concurrent_change = concurrent_change
         self.calls: list[str] = []
         self._next_uid = 100
 
@@ -40,6 +42,7 @@ class MemoryTodoEntity(TodoListEntity):
                 status=item.status or TodoItemStatus.NEEDS_ACTION,
             )
         )
+        self._add_concurrent_change()
         if self.emit_updates:
             self.async_update_listeners()
 
@@ -55,6 +58,7 @@ class MemoryTodoEntity(TodoListEntity):
         if uid != old.uid:
             self._next_uid += 1
         self._attr_todo_items[self._attr_todo_items.index(old)] = replace(item, uid=uid)
+        self._add_concurrent_change()
         if self.emit_updates:
             self.async_update_listeners()
 
@@ -63,11 +67,18 @@ class MemoryTodoEntity(TodoListEntity):
         self._attr_todo_items = [
             item for item in self._attr_todo_items if item.uid not in uids
         ]
+        self._add_concurrent_change()
         if self.emit_updates:
             self.async_update_listeners()
 
     async def async_update_ha_state(self, force_refresh: bool = False) -> None:
         del force_refresh
+
+    def _add_concurrent_change(self) -> None:
+        if self.concurrent_change is None:
+            return
+        self._attr_todo_items.append(self.concurrent_change)
+        self.concurrent_change = None
 
 
 class MemoryStore:
@@ -111,7 +122,22 @@ def engine(
         Side.B: snapshot(b.todo_items or []),
     }
     result.store = MemoryStore(pairs)
+    result._expected = {Side.A: [], Side.B: []}
     return result
+
+
+def subscribe_engine(runtime: TodoSyncEngine, hass: HomeAssistant) -> None:
+    """Attach a directly constructed engine to real HA callback scheduling."""
+    runtime.hass = hass
+    runtime.entity_ids = {Side.A: "todo.a", Side.B: "todo.b"}
+    runtime._unsub_updates = []
+    runtime._unsub_state = None
+    runtime._unsub_registry = None
+    runtime._stopped = False
+    runtime._lock = asyncio.Lock()
+    runtime._available = {Side.A: True, Side.B: True}
+    runtime._update_availability = lambda: None
+    runtime._subscribe()
 
 
 @pytest.mark.parametrize("source", [Side.A, Side.B])
@@ -148,16 +174,7 @@ async def test_real_subscription_payload_never_becomes_empty(
     a = MemoryTodoEntity([item("a")], emit_updates=True)
     b = MemoryTodoEntity([item("b")], emit_updates=True)
     runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
-    runtime.hass = hass
-    runtime.entity_ids = {Side.A: "todo.a", Side.B: "todo.b"}
-    runtime._unsub_updates = []
-    runtime._unsub_state = None
-    runtime._unsub_registry = None
-    runtime._stopped = False
-    runtime._lock = asyncio.Lock()
-    runtime._available = {Side.A: True, Side.B: True}
-    runtime._update_availability = lambda: None
-    runtime._subscribe()
+    subscribe_engine(runtime, hass)
 
     a.todo_items[0].status = TodoItemStatus.COMPLETED
     a.async_update_listeners()
@@ -167,6 +184,54 @@ async def test_real_subscription_payload_never_becomes_empty(
     assert b.calls == ["update"]
     assert a.calls == []
     assert "delete" not in b.calls
+    for unsubscribe in runtime._unsub_updates:
+        unsubscribe()
+    runtime._unsub_state()
+    runtime._unsub_registry()
+
+
+@pytest.mark.parametrize("operation", ["update", "create", "delete"])
+async def test_concurrent_target_addition_is_not_swallowed(
+    hass: HomeAssistant, operation: str
+) -> None:
+    """Expected echoes suppress only sync mutations, never concurrent additions."""
+    initial_items = [] if operation == "create" else [item("a")]
+    target_items = [] if operation == "create" else [item("b")]
+    a = MemoryTodoEntity(initial_items, emit_updates=True)
+    b = MemoryTodoEntity(
+        target_items,
+        emit_updates=True,
+        concurrent_change=item("bread-b", "Bread"),
+    )
+    pairs = [] if operation == "create" else [ItemPair("pair", "a", "b", "milk")]
+    runtime = engine(a, b, pairs)
+    subscribe_engine(runtime, hass)
+
+    if operation == "update":
+        a.todo_items[0].status = TodoItemStatus.COMPLETED
+    elif operation == "create":
+        a._attr_todo_items.append(item("a", "Milk"))
+    else:
+        a._attr_todo_items.clear()
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+
+    expected = {"Bread"} if operation == "delete" else {"Milk", "Bread"}
+    assert {todo.summary for todo in a.todo_items or []} == expected
+    assert {todo.summary for todo in b.todo_items or []} == expected
+    if operation == "update":
+        assert all(
+            todo.status is TodoItemStatus.COMPLETED
+            for entity in (a, b)
+            for todo in entity.todo_items or []
+            if todo.summary == "Milk"
+        )
+    assert not runtime._expected[Side.A]
+    assert not runtime._expected[Side.B]
+
+    calls = (list(a.calls), list(b.calls))
+    await hass.async_block_till_done()
+    assert (a.calls, b.calls) == calls
     for unsubscribe in runtime._unsub_updates:
         unsubscribe()
     runtime._unsub_state()

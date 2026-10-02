@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
@@ -37,6 +38,30 @@ class SyncSetupError(RuntimeError):
     """Raised when configured entity-registry references cannot be resolved."""
 
 
+class ExpectedOperationType(StrEnum):
+    """A mutation initiated by Todo Sync that may produce an echo callback."""
+
+    CREATE = "create"
+    UPDATE_STATUS = "update_status"
+    RENAME = "rename"
+    DELETE = "delete"
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedOperation:
+    """The exact before/after mutation expected from one provider."""
+
+    operation: ExpectedOperationType
+    before: SyncItem | None
+    after: SyncItem | None
+
+    def is_reflected_in(self, current: Snapshot) -> bool:
+        """Return whether a complete snapshot contains this exact result."""
+        if self.operation is ExpectedOperationType.DELETE:
+            return self.before is not None and self.before.uid not in current
+        return self.after is not None and current.get(self.after.uid) == self.after
+
+
 class TodoSyncEngine:
     """Synchronize two TodoListEntity instances using complete snapshots."""
 
@@ -54,6 +79,10 @@ class TodoSyncEngine:
         self._lock = asyncio.Lock()
         self._stopped = False
         self._available: dict[Side, bool] = {Side.A: False, Side.B: False}
+        self._expected: dict[Side, list[ExpectedOperation]] = {
+            Side.A: [],
+            Side.B: [],
+        }
 
     async def async_start(self) -> None:
         """Resolve entities, load state, subscribe, and establish a baseline."""
@@ -193,12 +222,29 @@ class TodoSyncEngine:
             if not self._both_available():
                 _LOGGER.debug("Deferring Todo Sync update while a list is unavailable")
                 return
+            self._consume_expected(side, current)
             previous = self.snapshots[side]
             if current == previous:
                 return
             await self._apply_delta(side, previous, current)
             self.snapshots[side] = current
-            self.snapshots[side.opposite] = self._current(side.opposite)
+
+    def _expect(self, side: Side, operation: ExpectedOperation) -> None:
+        """Advance only the exact target item changed by an internal operation."""
+        self._expected[side].append(operation)
+        baseline = self.snapshots[side]
+        if operation.before is not None:
+            baseline.pop(operation.before.uid, None)
+        if operation.after is not None:
+            baseline[operation.after.uid] = operation.after
+
+    def _consume_expected(self, side: Side, current: Snapshot) -> None:
+        """Consume reflected echoes without suppressing other snapshot changes."""
+        self._expected[side] = [
+            operation
+            for operation in self._expected[side]
+            if not operation.is_reflected_in(current)
+        ]
 
     def _pair_for_uid(self, side: Side, uid: str) -> ItemPair | None:
         return next(
@@ -238,7 +284,12 @@ class TodoSyncEngine:
                     target_uid,
                 )
             else:
+                deleted = self._current(side.opposite)[target_uid]
                 await self.entities[side.opposite].async_delete_todo_items([target_uid])
+                self._expect(
+                    side.opposite,
+                    ExpectedOperation(ExpectedOperationType.DELETE, deleted, None),
+                )
                 _LOGGER.debug("Propagated DELETE %s:%s", side, uid)
             self.store.pairs.pop(pair.pair_id, None)
 
@@ -341,6 +392,10 @@ class TodoSyncEngine:
                 "Could not identify newly created Todo Sync item unambiguously"
             )
             return None
+        self._expect(
+            side,
+            ExpectedOperation(ExpectedOperationType.CREATE, None, created[0]),
+        )
         return created[0]
 
     async def _update(
@@ -367,8 +422,6 @@ class TodoSyncEngine:
         await entity.async_update_todo_item(updated)
         await entity.async_update_ha_state(force_refresh=True)
         after = self._current(side)
-        if uid in after:
-            return after[uid]
         normalized = (
             summary.strip().casefold()
             if summary is not None
@@ -379,7 +432,21 @@ class TodoSyncEngine:
         candidates = [
             item for item in after.values() if item.normalized_summary == normalized
         ]
-        return candidates[0] if len(candidates) == 1 else None
+        result = after.get(uid) or (candidates[0] if len(candidates) == 1 else None)
+        if result is not None:
+            before = SyncItem.from_todo_item(existing)
+            if before is not None:
+                self._expect(
+                    side,
+                    ExpectedOperation(
+                        ExpectedOperationType.RENAME
+                        if summary is not None
+                        else ExpectedOperationType.UPDATE_STATUS,
+                        before,
+                        result,
+                    ),
+                )
+        return result
 
     async def async_reconcile(self) -> None:  # noqa: C901, PLR0912, PLR0915
         """Conservatively validate, repair, and merge complete list snapshots."""

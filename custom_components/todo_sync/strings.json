@@ -1,0 +1,25 @@
+{
+  "title": "Todo Sync",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Todo Sync",
+        "description": "Select two todo lists to synchronize bidirectionally.",
+        "data": {
+          "entity_a": "Todo list A",
+          "entity_b": "Todo list B"
+        }
+      }
+    },
+    "error": {
+      "same_entity": "Select two different todo lists.",
+      "not_todo_entity": "The selected entity is not a todo list.",
+      "entity_not_found": "The selected entity is not currently available in Home Assistant.",
+      "missing_capabilities": "The selected todo list must support creating, updating, and deleting items.",
+      "entity_not_registered": "The selected todo list is not registered in Home Assistant's entity registry."
+    },
+    "abort": {
+      "already_configured": "These two todo lists are already configured."
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "title": "Todo Sync",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Todo Sync einrichten",
+        "description": "Wähle zwei Aufgabenlisten für die bidirektionale Synchronisierung aus.",
+        "data": {
+          "entity_a": "Aufgabenliste A",
+          "entity_b": "Aufgabenliste B"
+        }
+      }
+    },
+    "error": {
+      "same_entity": "Wähle zwei unterschiedliche Aufgabenlisten aus.",
+      "not_todo_entity": "Die ausgewählte Entität ist keine Aufgabenliste.",
+      "entity_not_found": "Die ausgewählte Entität ist derzeit nicht in Home Assistant verfügbar.",
+      "missing_capabilities": "Die ausgewählte Aufgabenliste muss das Erstellen, Aktualisieren und Löschen von Einträgen unterstützen.",
+      "entity_not_registered": "Die ausgewählte Aufgabenliste ist nicht in der Entitätsregistrierung von Home Assistant registriert."
+    },
+    "abort": {
+      "already_configured": "Diese beiden Aufgabenlisten sind bereits konfiguriert."
+    }
+  }
+}

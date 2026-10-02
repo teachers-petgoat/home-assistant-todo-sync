@@ -5,8 +5,9 @@ Home Assistant `todo` entities bidirectionally. It uses Home Assistant as the
 only abstraction layer: it does not access todo vendors or store vendor
 credentials.
 
-> **Current status:** this initial scaffold provides UI configuration and
-> capability validation only. It does not synchronize or mutate todo items yet.
+The runtime observes complete `TodoListEntity` snapshots and synchronizes additions,
+status changes, renames, and safely mapped deletions in both directions. Persistent
+UID mappings and conservative startup reconciliation avoid duplicates and data loss.
 
 ## Installation
 
@@ -27,8 +28,12 @@ follow future entity-ID changes without assuming that entity IDs are permanent.
 
 ## Development
 
-Python 3.12 or newer is required. Create an isolated environment and install the
-development dependencies:
+Python 3.14.2 or newer is required. Tests intentionally pin
+`pytest-homeassistant-custom-component` 0.13.367, which installs Home Assistant
+2026.9.4. This is new enough to exercise the current `TodoListEntity` callback
+contract and the Alexa Devices todo platform; advancing Home Assistant requires
+updating the test fixture package pin in lockstep. Create an isolated environment
+and install the development dependencies:
 
 ```bash
 python -m venv .venv

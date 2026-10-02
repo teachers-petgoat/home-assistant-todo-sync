@@ -5,8 +5,9 @@ Home Assistant `todo` entities bidirectionally. It uses Home Assistant as the
 only abstraction layer: it does not access todo vendors or store vendor
 credentials.
 
-> **Current status:** this initial scaffold provides UI configuration and
-> capability validation only. It does not synchronize or mutate todo items yet.
+The runtime observes complete `TodoListEntity` snapshots and synchronizes additions,
+status changes, renames, and safely mapped deletions in both directions. Persistent
+UID mappings and conservative startup reconciliation avoid duplicates and data loss.
 
 ## Installation
 

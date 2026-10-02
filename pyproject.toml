@@ -37,3 +37,4 @@ ignore = ["ANN401", "COM812", "D203", "D213"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["FBT001", "S101"]
+"tests/test_sync.py" = ["D102", "D107", "FBT002", "PLR2004", "SLF001"]

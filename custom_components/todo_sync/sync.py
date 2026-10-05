@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -38,6 +39,11 @@ _LOGGER = logging.getLogger(__name__)
 # memory/suppression bound rather than a time-based delay.
 SETTLING_MAX_GENERATIONS = 5
 SETTLING_CONSECUTIVE_OBSERVATIONS = 2
+
+# Cloud providers can briefly omit an item from otherwise complete snapshots.
+# Destructive propagation requires a later observation outside this interval.
+REMOVAL_STABILIZATION_SECONDS = 5.0
+RECENT_ITEM_STABILIZATION_SECONDS = 5.0
 
 
 class SyncSetupError(RuntimeError):
@@ -90,6 +96,19 @@ class SettlingOperation:
     inverse_observations: int = 0
 
 
+@dataclass(slots=True)
+class RemovalCandidate:
+    """A mapped disappearance awaiting independent destructive confirmation."""
+
+    side: Side
+    uid: str
+    pair_id: str
+    previous: SyncItem
+    first_missing_generation: int
+    first_missing_monotonic: float
+    missing_observations: int = 1
+
+
 class TodoSyncEngine:
     """Synchronize two TodoListEntity instances using complete snapshots."""
 
@@ -118,6 +137,8 @@ class TodoSyncEngine:
             Side.B: [],
         }
         self._generation: dict[Side, int] = {Side.A: 0, Side.B: 0}
+        self._removal_candidates: dict[tuple[Side, str], RemovalCandidate] = {}
+        self._recent_items: dict[tuple[Side, str], float] = {}
 
     async def async_start(self) -> None:
         """Resolve entities, load state, subscribe, and establish a baseline."""
@@ -272,6 +293,11 @@ class TodoSyncEngine:
             if len(self._expected[side]) != pending_count:
                 await self.store.async_save()
             if effective == previous:
+                if any(
+                    candidate_side is side
+                    for candidate_side, _uid in self._removal_candidates
+                ):
+                    await self._apply_delta(side, previous, effective)
                 self.snapshots[side] = authoritative
                 return
             await self._apply_delta(side, previous, effective)
@@ -360,6 +386,8 @@ class TodoSyncEngine:
         self, side: Side, operation: ExpectedOperation, uid: str
     ) -> None:
         """Adopt a provider-assigned UID after create or replacement rename."""
+        if uid:
+            self._recent_items[(side, uid)] = time.monotonic()
         if operation.operation is ExpectedOperationType.CREATE:
             if operation.source_side is None or operation.source_uid is None:
                 return
@@ -490,24 +518,136 @@ class TodoSyncEngine:
             (pair for pair in self.store.pairs.values() if pair.uid(side) == uid), None
         )
 
-    async def _apply_delta(
-        self, side: Side, previous: Snapshot, current: Snapshot
+    def _operation_protects_removal(self, uid: str, pair_id: str) -> bool:
+        """Return whether create/rename operation context makes absence unsafe."""
+        protected = (ExpectedOperationType.CREATE, ExpectedOperationType.RENAME)
+        operations = [
+            *(operation for values in self._expected.values() for operation in values),
+            *(
+                guard.expected
+                for values in self._confirmed.values()
+                for guard in values
+            ),
+        ]
+        return any(
+            operation.operation in protected
+            and (
+                operation.pair_id == pair_id
+                or operation.source_uid == uid
+                or (operation.before is not None and operation.before.uid == uid)
+                or (operation.after is not None and operation.after.uid == uid)
+            )
+            for operation in operations
+        )
+
+    def _observe_removal(self, side: Side, pair: ItemPair, previous: SyncItem) -> bool:
+        """Quarantine an omission and return whether deletion is now confirmed."""
+        uid = previous.uid
+        if self._operation_protects_removal(uid, pair.pair_id):
+            _LOGGER.debug(
+                "Removal remains protected by pending/settling operation for %s:%s",
+                side,
+                uid,
+            )
+            return False
+        now = time.monotonic()
+        key = (side, uid)
+        candidate = self._removal_candidates.get(key)
+        if candidate is None:
+            self._removal_candidates[key] = RemovalCandidate(
+                side=side,
+                uid=uid,
+                pair_id=pair.pair_id,
+                previous=previous,
+                first_missing_generation=self._generation[side],
+                first_missing_monotonic=now,
+            )
+            _LOGGER.debug(
+                "Removal candidate created for %s:%s pair %s at generation %d",
+                side,
+                uid,
+                pair.pair_id,
+                self._generation[side],
+            )
+            return False
+        candidate.missing_observations += 1
+        elapsed = now - candidate.first_missing_monotonic
+        recent_elapsed = now - self._recent_items.get(key, float("-inf"))
+        _LOGGER.debug(
+            "Removal candidate %s:%s missing observation count %d",
+            side,
+            uid,
+            candidate.missing_observations,
+        )
+        if (
+            elapsed < REMOVAL_STABILIZATION_SECONDS
+            or recent_elapsed < RECENT_ITEM_STABILIZATION_SECONDS
+        ):
+            _LOGGER.debug(
+                "Removal %s:%s still inside stabilization window (%.3fs)",
+                side,
+                uid,
+                elapsed,
+            )
+            return False
+        return True
+
+    def _cancel_or_repair_removal_candidates(
+        self, side: Side, current: Snapshot
+    ) -> set[str]:
+        """Cancel returned omissions or adopt an unambiguous replacement UID."""
+        handled_additions: set[str] = set()
+        for key, candidate in list(self._removal_candidates.items()):
+            if candidate.side is not side:
+                continue
+            if candidate.uid in current:
+                self._removal_candidates.pop(key)
+                handled_additions.add(candidate.uid)
+                _LOGGER.debug(
+                    "Removal candidate cancelled because item returned for %s:%s",
+                    side,
+                    candidate.uid,
+                )
+                continue
+            replacements = [
+                item
+                for item in current.values()
+                if item.normalized_summary == candidate.previous.normalized_summary
+                and self._pair_for_uid(side, item.uid) is None
+            ]
+            if len(replacements) != 1:
+                continue
+            pair = self.store.pairs.get(candidate.pair_id)
+            if pair is None:
+                continue
+            replacement = replacements[0]
+            pair.set_uid(side, replacement.uid)
+            self._removal_candidates.pop(key)
+            self._recent_items[(side, replacement.uid)] = time.monotonic()
+            handled_additions.add(replacement.uid)
+            _LOGGER.debug(
+                "Mapping repaired after replacement UID %s:%s -> %s",
+                side,
+                candidate.uid,
+                replacement.uid,
+            )
+        return handled_additions
+
+    async def _process_removals(
+        self,
+        side: Side,
+        previous: Snapshot,
+        current: Snapshot,
+        removed: set[str],
     ) -> None:
-        removed = set(previous) - set(current)
-        added = set(current) - set(previous)
-
-        # A common provider rename implementation is one removal plus one creation.
-        if len(removed) == len(added) == 1:
-            old_uid, new_uid = next(iter(removed)), next(iter(added))
-            pair = self._pair_for_uid(side, old_uid)
-            old, new = previous[old_uid], current[new_uid]
-            if pair and old.status == new.status:
-                pair.set_uid(side, new_uid)
-                await self._propagate_change(side, pair, old, new)
-                await self.store.async_save()
-                return
-
-        for uid in removed:
+        """Observe omissions and propagate only confirmed mapped deletions."""
+        candidate_uids = {
+            uid
+            for candidate_side, uid in self._removal_candidates
+            if candidate_side is side and uid not in current
+        }
+        confirmed: list[tuple[str, ItemPair]] = []
+        for uid in removed | candidate_uids:
             pair = self._pair_for_uid(side, uid)
             if pair is None:
                 _LOGGER.warning(
@@ -516,27 +656,71 @@ class TodoSyncEngine:
                     uid,
                 )
                 continue
+            candidate = self._removal_candidates.get((side, uid))
+            prior = previous.get(uid) or (candidate.previous if candidate else None)
+            if prior is not None and self._observe_removal(side, pair, prior):
+                confirmed.append((uid, pair))
+
+        for uid, pair in confirmed:
             target_uid = pair.uid(side.opposite)
-            if target_uid not in self._current(side.opposite):
+            target_item = self._current(side.opposite).get(target_uid)
+            if target_item is None:
                 _LOGGER.warning(
                     "Delete target %s no longer exists; removing stale mapping",
                     target_uid,
                 )
             else:
-                deleted = self._current(side.opposite)[target_uid]
                 await self.entities[side.opposite].async_delete_todo_items([target_uid])
                 self._expect(
                     side.opposite,
                     ExpectedOperation(
                         ExpectedOperationType.DELETE,
-                        deleted,
+                        target_item,
                         None,
                         frozenset(self.snapshots[side.opposite]),
                         pair_id=pair.pair_id,
                     ),
                 )
-                _LOGGER.debug("Propagated DELETE %s:%s", side, uid)
+                _LOGGER.debug("Confirmed delete propagated for %s:%s", side, uid)
             self.store.pairs.pop(pair.pair_id, None)
+            self._removal_candidates.pop((side, uid), None)
+            self._recent_items.pop((side, uid), None)
+
+    async def _apply_delta(
+        self, side: Side, previous: Snapshot, current: Snapshot
+    ) -> None:
+        removed = set(previous) - set(current)
+        added = set(current) - set(previous)
+
+        added -= self._cancel_or_repair_removal_candidates(side, current)
+        now = time.monotonic()
+        for uid in added:
+            self._recent_items[(side, uid)] = now
+
+        # A provider may replace a UID without changing the logical item. Repair
+        # only exact semantic identity here; a different summary could instead be
+        # an unrelated ADD concurrent with a transient omission.
+        if len(removed) == len(added) == 1:
+            old_uid, new_uid = next(iter(removed)), next(iter(added))
+            pair = self._pair_for_uid(side, old_uid)
+            old, new = previous[old_uid], current[new_uid]
+            if (
+                pair
+                and old.normalized_summary == new.normalized_summary
+                and old.status == new.status
+            ):
+                pair.set_uid(side, new_uid)
+                self._recent_items[(side, new_uid)] = now
+                _LOGGER.debug(
+                    "Mapping repaired after replacement UID %s:%s -> %s",
+                    side,
+                    old_uid,
+                    new_uid,
+                )
+                await self.store.async_save()
+                return
+
+        await self._process_removals(side, previous, current, removed)
 
         for uid in added:
             await self._propagate_add(side, current[uid])
@@ -553,6 +737,8 @@ class TodoSyncEngine:
 
     async def _propagate_add(self, source: Side, item: SyncItem) -> None:
         target = source.opposite
+        if self._pair_for_uid(source, item.uid) is not None:
+            return
         if any(
             operation.operation is ExpectedOperationType.CREATE
             and operation.source_side is source
@@ -698,6 +884,7 @@ class TodoSyncEngine:
                 "Could not identify newly created Todo Sync item unambiguously"
             )
             return None
+        self._recent_items[(side, result.uid)] = time.monotonic()
         return result
 
     async def _update(
@@ -769,6 +956,9 @@ class TodoSyncEngine:
             for pair_id, pair in list(self.store.pairs.items()):
                 for side in (Side.A, Side.B):
                     if pair.uid(side) in current[side]:
+                        continue
+                    if (side, pair.uid(side)) in self._removal_candidates:
+                        conflicts += 1
                         continue
                     candidates = [
                         item

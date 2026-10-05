@@ -10,6 +10,7 @@ import pytest
 from homeassistant.components.todo import TodoItem, TodoItemStatus, TodoListEntity
 from homeassistant.core import HomeAssistant
 
+from custom_components.todo_sync import sync as sync_module
 from custom_components.todo_sync.models import ItemPair, Side, snapshot
 from custom_components.todo_sync.sync import TodoSyncEngine
 
@@ -125,6 +126,8 @@ def engine(
     result._expected = {Side.A: [], Side.B: []}
     result._confirmed = {Side.A: [], Side.B: []}
     result._generation = {Side.A: 0, Side.B: 0}
+    result._removal_candidates = {}
+    result._recent_items = {}
     return result
 
 
@@ -239,9 +242,14 @@ async def test_concurrent_target_addition_is_not_swallowed(
     a.async_update_listeners()
     await hass.async_block_till_done()
 
-    expected = {"Bread"} if operation == "delete" else {"Milk", "Bread"}
-    assert {todo.summary for todo in a.todo_items or []} == expected
-    assert {todo.summary for todo in b.todo_items or []} == expected
+    if operation == "delete":
+        assert a.todo_items == []
+        assert {todo.summary for todo in b.todo_items or []} == {"Milk"}
+        assert "pair" in runtime.store.pairs
+    else:
+        expected = {"Milk", "Bread"}
+        assert {todo.summary for todo in a.todo_items or []} == expected
+        assert {todo.summary for todo in b.todo_items or []} == expected
     if operation == "update":
         assert all(
             todo.status is TodoItemStatus.COMPLETED
@@ -322,7 +330,9 @@ async def test_rename_both_directions_and_replacement_uid(source: Side) -> None:
 
 
 @pytest.mark.parametrize("source", [Side.A, Side.B])
-async def test_mapped_delete_both_directions(source: Side) -> None:
+async def test_mapped_delete_both_directions(
+    source: Side, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Only the exact mapped target UID is deleted."""
     entities = {
         Side.A: MemoryTodoEntity([item("a")]),
@@ -331,9 +341,14 @@ async def test_mapped_delete_both_directions(source: Side) -> None:
     runtime = engine(
         entities[Side.A], entities[Side.B], [ItemPair("pair", "a", "b", "milk")]
     )
+    clock = 0.0
+    monkeypatch.setattr(sync_module.time, "monotonic", lambda: clock)
     previous = runtime._current(source)
     entities[source]._attr_todo_items.clear()
     await runtime._apply_delta(source, previous, {})
+    assert entities[source.opposite].todo_items != []
+    clock = 6.0
+    await runtime._apply_delta(source, {}, {})
     assert entities[source.opposite].todo_items == []
     assert runtime.store.pairs == {}
 
@@ -427,7 +442,7 @@ async def test_delayed_create_masks_old_snapshots_and_adopts_uid(
 
 
 async def test_delayed_delete_is_not_recreated(hass: HomeAssistant) -> None:
-    """The unchanged pre-delete callback is stale, not a new addition."""
+    """One source omission is quarantined rather than recreated or deleted."""
     a = MemoryTodoEntity([item("a")], emit_updates=True)
     b = DelayedTodoEntity([item("b")])
     runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
@@ -441,9 +456,10 @@ async def test_delayed_delete_is_not_recreated(hass: HomeAssistant) -> None:
     b.cloud_snapshot([])
     await hass.async_block_till_done()
 
-    assert b.calls == ["delete"]
+    assert b.calls == []
     assert a.calls == []
     assert not a.todo_items
+    assert "pair" in runtime.store.pairs
 
 
 async def test_delayed_status_does_not_propagate_inverse(
@@ -575,9 +591,11 @@ async def test_alternating_stale_create_snapshots_remain_bounded(
 
 
 async def test_settled_create_allows_later_user_delete(
-    hass: HomeAssistant,
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A CREATE guard retires before a later genuine target-side DELETE."""
+    clock = 0.0
+    monkeypatch.setattr(sync_module.time, "monotonic", lambda: clock)
     a = MemoryTodoEntity([], emit_updates=True)
     b = DelayedTodoEntity([])
     runtime = engine(a, b)
@@ -592,6 +610,9 @@ async def test_settled_create_allows_later_user_delete(
     await hass.async_block_till_done()
     assert not runtime._confirmed[Side.B]
 
+    b.cloud_snapshot([])
+    await hass.async_block_till_done()
+    clock = sync_module.REMOVAL_STABILIZATION_SECONDS
     b.cloud_snapshot([])
     await hass.async_block_till_done()
 
@@ -653,15 +674,20 @@ async def test_settled_rename_allows_later_rename_back(
 
 
 async def test_settled_delete_allows_later_genuine_readd(
-    hass: HomeAssistant,
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A new same-summary item after a settled DELETE is synchronized as an ADD."""
+    clock = 0.0
+    monkeypatch.setattr(sync_module.time, "monotonic", lambda: clock)
     a = MemoryTodoEntity([item("a")], emit_updates=True)
     b = DelayedTodoEntity([item("b")])
     runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
     subscribe_engine(runtime, hass)
 
     a._attr_todo_items.clear()
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    clock = sync_module.REMOVAL_STABILIZATION_SECONDS
     a.async_update_listeners()
     await hass.async_block_till_done()
     b.cloud_snapshot([])
@@ -702,3 +728,151 @@ async def test_confirmed_guards_are_retired_after_many_settled_operations(
     assert len(b.calls) == 8
     assert not runtime._expected[Side.B]
     assert not runtime._confirmed[Side.B]
+
+
+async def test_single_stale_omission_after_create_returns_without_delete(
+    hass: HomeAssistant,
+) -> None:
+    """A newly created cloud item may vanish once without reversing CREATE."""
+    a = MemoryTodoEntity([], emit_updates=True)
+    b = DelayedTodoEntity([])
+    runtime = engine(a, b)
+    subscribe_engine(runtime, hass)
+
+    a._attr_todo_items.append(item("a"))
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("b")])
+    await hass.async_block_till_done()
+    b.cloud_snapshot([])
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("b")])
+    await hass.async_block_till_done()
+
+    assert a.calls == []
+    assert b.calls == ["create"]
+    assert runtime.store.pairs[next(iter(runtime.store.pairs))].b_uid == "b"
+    assert len(a.todo_items or []) == len(b.todo_items or []) == 1
+
+
+async def test_rapid_repeated_omissions_do_not_confirm_delete(
+    hass: HomeAssistant,
+) -> None:
+    """Rapid omissions of a newly created target remain non-destructive."""
+    a = MemoryTodoEntity([], emit_updates=True)
+    b = DelayedTodoEntity([])
+    runtime = engine(a, b)
+    subscribe_engine(runtime, hass)
+
+    a._attr_todo_items.append(item("a"))
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("b")])
+    b.cloud_snapshot([item("b")])
+    await hass.async_block_till_done()
+    b.cloud_snapshot([])
+    b.cloud_snapshot([])
+    await hass.async_block_till_done()
+    b.cloud_snapshot([item("b")])
+    await hass.async_block_till_done()
+
+    assert a.calls == []
+    assert b.calls == ["create"]
+    assert next(iter(runtime.store.pairs.values())).b_uid == "b"
+    assert runtime._removal_candidates == {}
+
+
+async def test_confirmed_user_delete_requires_later_callback(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stable mapped deletion propagates once after timed confirmation."""
+    clock = 100.0
+    monkeypatch.setattr(sync_module.time, "monotonic", lambda: clock)
+    a = MemoryTodoEntity([item("a")], emit_updates=True)
+    b = DelayedTodoEntity([item("b")])
+    runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
+    subscribe_engine(runtime, hass)
+
+    a._attr_todo_items.clear()
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    assert b.calls == []
+    clock += sync_module.REMOVAL_STABILIZATION_SECONDS
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+
+    assert b.calls == ["delete"]
+    assert runtime.store.pairs == {}
+
+
+async def test_one_missing_observation_remains_pending(hass: HomeAssistant) -> None:
+    """No follow-up callback means no destructive convergence attempt."""
+    a = MemoryTodoEntity([item("a")], emit_updates=True)
+    b = MemoryTodoEntity([item("b")])
+    runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
+    subscribe_engine(runtime, hass)
+
+    a._attr_todo_items.clear()
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+
+    assert b.calls == []
+    assert "pair" in runtime.store.pairs
+    assert (Side.A, "a") in runtime._removal_candidates
+
+
+async def test_pending_removal_does_not_block_unrelated_add(
+    hass: HomeAssistant,
+) -> None:
+    """A quarantined omission is local to its UID while another ADD syncs."""
+    a = MemoryTodoEntity([item("a")], emit_updates=True)
+    b = MemoryTodoEntity([item("b")])
+    runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
+    subscribe_engine(runtime, hass)
+
+    a._attr_todo_items[:] = [item("bread-a", "Bread")]
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+
+    assert "pair" in runtime.store.pairs
+    assert {value.summary for value in b.todo_items or []} == {"Milk", "Bread"}
+    assert b.calls == ["create"]
+
+
+async def test_removal_candidate_replacement_uid_repairs_mapping(
+    hass: HomeAssistant,
+) -> None:
+    """An unambiguous same-summary replacement repairs identity without writes."""
+    a = MemoryTodoEntity([item("a")], emit_updates=True)
+    b = MemoryTodoEntity([item("b")])
+    runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
+    subscribe_engine(runtime, hass)
+
+    a._attr_todo_items.clear()
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+    a._attr_todo_items.append(item("replacement-a"))
+    a.async_update_listeners()
+    await hass.async_block_till_done()
+
+    assert runtime.store.pairs["pair"].a_uid == "replacement-a"
+    assert a.calls == b.calls == []
+    assert runtime._removal_candidates == {}
+
+
+async def test_long_inconsistency_sequence_has_no_destructive_mutations(
+    hass: HomeAssistant,
+) -> None:
+    """Alternating presence inside stabilization never deletes or recreates."""
+    a = MemoryTodoEntity([item("a")])
+    b = DelayedTodoEntity([item("b")])
+    runtime = engine(a, b, [ItemPair("pair", "a", "b", "milk")])
+    subscribe_engine(runtime, hass)
+
+    for values in ([], [], [item("b")], [], [item("b")]):
+        b.cloud_snapshot(values)
+        await hass.async_block_till_done()
+
+    assert a.calls == []
+    assert b.calls == []
+    assert len(runtime.store.pairs) == 1

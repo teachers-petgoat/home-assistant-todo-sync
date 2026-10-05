@@ -53,3 +53,13 @@ python -m json.tool custom_components/todo_sync/manifest.json >/dev/null
 The config-flow tests exercise successful setup, per-entity validation, all
 required capability combinations, duplicate/reversed pairs, registry-reference
 storage, and the basic setup/unload lifecycle.
+
+## Troubleshooting
+
+Alexa Devices currently relies on `aioamazondevices` push/list consistency. An
+upstream `itemCreated` push can arrive before the new UID is visible in the
+following list read, so Home Assistant may briefly expose a snapshot that omits
+the new item. Todo Sync treats single and rapid repeated omissions as removal
+candidates rather than deletes. It only propagates a mapped deletion after a
+later observation outside the stabilization interval; if the item returns, the
+candidate is cancelled without changing the other provider.
